@@ -405,6 +405,9 @@ const (
 )
 
 const (
+	// CloseEnvelopeType is sent when the SSH session is over without any errors.
+	CloseEnvelopeType = "c"
+
 	// AuditEnvelopeType is sending a audit event over the websocket to the web client.
 	AuditEnvelopeType = "a"
 
