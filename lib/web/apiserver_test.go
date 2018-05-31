@@ -960,15 +960,13 @@ func (s *WebSuite) TestResizeTerminal(c *C) {
 	// because resize events are not sent back to the originator.
 	params, err := session.NewTerminalParamsFromInt(300, 120)
 	c.Assert(err, IsNil)
-	websocket.JSON.Send(ws2, eventEnvelope{
-		Type: defaults.ResizeRequestEnvelopeType,
-		Payload: events.EventFields{
-			events.EventType:      events.ResizeEvent,
-			events.EventNamespace: defaults.Namespace,
-			events.SessionEventID: sid.String(),
-			events.TerminalSize:   params.Serialize(),
-		},
+	data, err := json.Marshal(events.EventFields{
+		events.EventType:      events.ResizeEvent,
+		events.EventNamespace: defaults.Namespace,
+		events.SessionEventID: sid.String(),
+		events.TerminalSize:   params.Serialize(),
 	})
+	websocket.Message.Send(ws2, defaults.ResizeWebsocketPrefix+string(data))
 
 	// This time the first terminal will see the resize event.
 	err = s.waitForResizeEvent(ws1, 5*time.Second)
@@ -1473,12 +1471,12 @@ func (s *WebSuite) waitForRawEvent(ws *websocket.Conn, timeout time.Duration) er
 		for {
 			time.Sleep(250 * time.Millisecond)
 
-			var ue unknownEnvelope
-			err := websocket.JSON.Receive(ws, &ue)
+			var data []byte
+			err := websocket.Message.Receive(ws, &data)
 			if err != nil {
 				continue
 			}
-			if ue.Type == defaults.RawEnvelopeType {
+			if string(data[0]) == defaults.RawWebsocketPrefix {
 				doneCancel()
 				return
 			}
@@ -1505,23 +1503,23 @@ func (s *WebSuite) waitForResizeEvent(ws *websocket.Conn, timeout time.Duration)
 		for {
 			time.Sleep(250 * time.Millisecond)
 
-			var ue unknownEnvelope
-			err := websocket.JSON.Receive(ws, &ue)
+			var data []byte
+			err := websocket.Message.Receive(ws, &data)
 			if err != nil {
 				continue
 			}
 
-			if ue.Type != defaults.AuditEnvelopeType {
+			if string(data[0]) != defaults.AuditWebsocketPrefix {
 				continue
 			}
 
-			var ee eventEnvelope
-			err = json.Unmarshal(ue.Raw, &ee)
+			var e events.EventFields
+			err = json.Unmarshal(data[1:], &e)
 			if err != nil {
 				continue
 			}
 
-			if ee.Payload.GetType() == events.ResizeEvent {
+			if e.GetType() == events.ResizeEvent {
 				doneCancel()
 				return
 			}

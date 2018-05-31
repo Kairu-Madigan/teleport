@@ -124,6 +124,8 @@ func NewTerminal(req TerminalRequest, authProvider AuthProvider, ctx *SessionCon
 		hostPort:       hostPort,
 		authProvider:   authProvider,
 		sessionTimeout: req.SessionTimeout,
+		encoder:        unicode.UTF8.NewEncoder(),
+		decoder:        unicode.UTF8.NewDecoder(),
 	}, nil
 }
 
@@ -174,6 +176,12 @@ type TerminalHandler struct {
 
 	// sessionTimeout is how long to wait for the session end event to arrive.
 	sessionTimeout time.Duration
+
+	// encoder is used to encode strings into UTF-8.
+	encoder *encoding.Encoder
+
+	// decoder is used to decode UTF-8 strings.
+	decoder *encoding.Decoder
 }
 
 // Serve builds a connect to the remote node and then pumps back two types of
@@ -225,7 +233,7 @@ func (t *TerminalHandler) handler(ws *websocket.Conn) {
 	// the terminal.
 	tc, err := t.makeClient(ws)
 	if err != nil {
-		er := errToTerm(err, ws)
+		er := t.errToTerm(err, ws)
 		if er != nil {
 			t.log.Warnf("Unable to send error to terminal: %v: %v.", err, er)
 		}
@@ -319,7 +327,7 @@ func (t *TerminalHandler) streamTerminal(ws *websocket.Conn, tc *client.Teleport
 	err := tc.SSH(t.terminalContext, t.params.InteractiveCommand, false)
 	if err != nil {
 		t.log.Warnf("Unable to stream terminal: %v.", err)
-		er := errToTerm(err, ws)
+		er := t.errToTerm(err, ws)
 		if er != nil {
 			t.log.Warnf("Unable to send error to terminal: %v: %v.", err, er)
 		}
@@ -327,10 +335,7 @@ func (t *TerminalHandler) streamTerminal(ws *websocket.Conn, tc *client.Teleport
 	}
 
 	// Send close envelope to web terminal upon exit without an error.
-	e := eventEnvelope{
-		Type: defaults.CloseEnvelopeType,
-	}
-	err = websocket.JSON.Send(ws, e)
+	err = websocket.Message.Send(ws, defaults.CloseWebsocketPrefix)
 	if err != nil {
 		t.log.Errorf("Unable to send close event to web client.")
 		return
@@ -345,15 +350,18 @@ func (t *TerminalHandler) streamEvents(ws *websocket.Conn, tc *client.TeleportCl
 		select {
 		// Send push events that come over the events channel to the web client.
 		case event := <-tc.EventsChannel():
-			e := eventEnvelope{
-				Type:    defaults.AuditEnvelopeType,
-				Payload: event,
+			data, err := json.Marshal(event)
+			if err != nil {
+				t.log.Errorf("Unable to marshal audit event %v: %v.", event.GetType(), err)
+				continue
 			}
+
 			t.log.Debugf("Sending audit event %v to web client.", event.GetType())
 
-			err := websocket.JSON.Send(ws, e)
+			encoded, err := t.encoder.String(defaults.AuditWebsocketPrefix + string(data))
+			err = websocket.Message.Send(ws, encoded)
 			if err != nil {
-				t.log.Errorf("Unable to %v event to web client: %v.", event.GetType(), err)
+				t.log.Errorf("Unable to send audit event %v to web client: %v.", event.GetType(), err)
 				continue
 			}
 		// Once the terminal stream is over (and the close envelope has been sent),
@@ -386,23 +394,18 @@ func (t *TerminalHandler) windowChange(params *session.TerminalParams) error {
 }
 
 // errToTerm displays an error in the terminal window.
-func errToTerm(err error, w io.Writer) error {
+func (t *TerminalHandler) errToTerm(err error, w io.Writer) error {
 	// Replace \n with \r\n so the message correctly aligned.
 	r := strings.NewReplacer("\r\n", "\r\n", "\n", "\r\n")
 	errMessage := r.Replace(err.Error())
 
-	// Create an envelope that contains the error message.
-	re := rawEnvelope{
-		Type:    defaults.RawEnvelopeType,
-		Payload: errMessage,
-	}
-	b, err := json.Marshal(re)
+	encoded, err := t.encoder.String(defaults.RawWebsocketPrefix + errMessage)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
 	// Write the error to the websocket.
-	_, err = w.Write(b)
+	_, err = w.Write([]byte(encoded))
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -470,17 +473,12 @@ func newWrappedSocket(ws *websocket.Conn, terminal *TerminalHandler) *wrappedSoc
 
 // Write wraps the data bytes in a raw envelope and sends.
 func (w *wrappedSocket) Write(data []byte) (n int, err error) {
-	encodedString, err := w.encoder.String(string(data))
+	encoded, err := w.encoder.String(defaults.RawWebsocketPrefix + string(data))
 	if err != nil {
 		return 0, trace.Wrap(err)
 	}
 
-	e := rawEnvelope{
-		Type:    defaults.RawEnvelopeType,
-		Payload: encodedString,
-	}
-
-	err = websocket.JSON.Send(w.ws, e)
+	err = websocket.Message.Send(w.ws, encoded)
 	if err != nil {
 		return 0, trace.Wrap(err)
 	}
@@ -491,8 +489,8 @@ func (w *wrappedSocket) Write(data []byte) (n int, err error) {
 // Read unwraps the envelope and either fills out the passed in bytes or
 // performs an action on the connection (sending window-change request).
 func (w *wrappedSocket) Read(out []byte) (n int, err error) {
-	var ue unknownEnvelope
-	err = websocket.JSON.Receive(w.ws, &ue)
+	var str string
+	err = websocket.Message.Receive(w.ws, &str)
 	if err != nil {
 		if err == io.EOF {
 			return 0, io.EOF
@@ -500,37 +498,36 @@ func (w *wrappedSocket) Read(out []byte) (n int, err error) {
 		return 0, trace.Wrap(err)
 	}
 
-	switch ue.Type {
-	case defaults.RawEnvelopeType:
-		var re rawEnvelope
-		err := json.Unmarshal(ue.Raw, &re)
-		if err != nil {
-			return 0, trace.Wrap(err)
-		}
+	var data []byte
+	data, err = w.decoder.Bytes([]byte(str))
+	if err != nil {
+		return 0, trace.Wrap(err)
+	}
 
-		decodedString, err := w.decoder.String(re.Payload)
-		if err != nil {
-			return 0, trace.Wrap(err)
-		}
+	if len(data) < 1 {
+		return 0, trace.BadParameter("frame must have length of at least 1")
+	}
 
-		data := []byte(decodedString)
-		if len(out) < len(data) {
-			w.terminal.log.Warnf("websocket failed to receive everything: %d vs %d", len(out), len(data))
+	switch string(data[0]) {
+	case defaults.RawWebsocketPrefix:
+		if len(out) < len(data[1:]) {
+			if w.terminal != nil {
+				w.terminal.log.Warnf("websocket failed to receive everything: %d vs %d", len(out), len(data))
+			}
 		}
-
-		return copy(out, data), nil
-	case defaults.ResizeRequestEnvelopeType:
+		return copy(out, data[1:]), nil
+	case defaults.ResizeWebsocketPrefix:
 		if w.terminal == nil {
 			return 0, nil
 		}
 
-		var ee eventEnvelope
-		err := json.Unmarshal(ue.Raw, &ee)
+		var e events.EventFields
+		err := json.Unmarshal(data[1:], &e)
 		if err != nil {
 			return 0, trace.Wrap(err)
 		}
 
-		params, err := session.UnmarshalTerminalParams(ee.Payload.GetString("size"))
+		params, err := session.UnmarshalTerminalParams(e.GetString("size"))
 		if err != nil {
 			return 0, trace.Wrap(err)
 		}
@@ -541,7 +538,7 @@ func (w *wrappedSocket) Read(out []byte) (n int, err error) {
 
 		return 0, nil
 	default:
-		return 0, trace.BadParameter("unknown envelope type")
+		return 0, trace.BadParameter("unknown prefix type: %v", string(data[0]))
 	}
 }
 
@@ -557,33 +554,5 @@ func (w *wrappedSocket) Close() error {
 
 // eventEnvelope is used to send/receive audit events.
 type eventEnvelope struct {
-	Type    string             `json:"t"`
 	Payload events.EventFields `json:"p"`
-}
-
-// rawEnvelope is used to send/receive terminal bytes.
-type rawEnvelope struct {
-	Type    string `json:"t"`
-	Payload string `json:"p"`
-}
-
-// unknownEnvelope is used to figure out the type of data being unmarshaled.
-type unknownEnvelope struct {
-	envelopeHeader
-	Raw []byte
-}
-
-type envelopeHeader struct {
-	Type string `json:"t"`
-}
-
-func (u *unknownEnvelope) UnmarshalJSON(raw []byte) error {
-	var eh envelopeHeader
-	if err := json.Unmarshal(raw, &eh); err != nil {
-		return err
-	}
-	u.Type = eh.Type
-	u.Raw = make([]byte, len(raw))
-	copy(u.Raw, raw)
-	return nil
 }

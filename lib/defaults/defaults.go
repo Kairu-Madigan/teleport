@@ -405,18 +405,18 @@ const (
 )
 
 const (
-	// CloseEnvelopeType is sent when the SSH session is over without any errors.
-	CloseEnvelopeType = "c"
+	// CloseWebsocketPrefix is sent when the SSH session is over without any errors.
+	CloseWebsocketPrefix = "c"
 
-	// AuditEnvelopeType is sending a audit event over the websocket to the web client.
-	AuditEnvelopeType = "a"
+	// AuditWebsocketPrefix is sending a audit event over the websocket to the web client.
+	AuditWebsocketPrefix = "a"
 
-	// RawEnvelopeType is sending raw terminal bytes over the websocket to the web
+	// RawWebsocketPrefix is sending raw terminal bytes over the websocket to the web
 	// client.
-	RawEnvelopeType = "r"
+	RawWebsocketPrefix = "r"
 
-	// ResizeRequestEnvelopeType is receiving a resize request.
-	ResizeRequestEnvelopeType = "r.r"
+	// ResizeWebsocketPrefix is receiving a resize request.
+	ResizeWebsocketPrefix = "w"
 )
 
 // The following are cryptographic primitives Teleport does not support in
